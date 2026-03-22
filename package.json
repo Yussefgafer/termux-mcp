@@ -1,0 +1,19 @@
+{
+  "name": "termux-mcp",
+  "version": "0.1.0",
+  "description": "Streamable HTTP MCP server for Termux",
+  "type": "module",
+  "bin": {
+    "termux-mcp": "./bin/termux-mcp",
+    "termux-mcp-shutdown": "./bin/termux-mcp-shutdown"
+  },
+  "scripts": {
+    "start": "node ./src/server.js",
+    "check": "node --check ./src/server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "express": "^5.1.0",
+    "zod": "^3.25.76"
+  }
+}
