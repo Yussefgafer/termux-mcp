@@ -25,7 +25,6 @@ const MAX_IMAGE_BYTES = Number(process.env.TERMUX_MCP_MAX_IMAGE_BYTES || 8 * 102
 const SESSION_IDLE_MS = Number(process.env.TERMUX_MCP_SESSION_IDLE_MS || 30 * 60 * 1000);
 const RECENT_SESSION_TTL_MS = Number(process.env.TERMUX_MCP_RECENT_SESSION_TTL_MS || 10 * 60 * 1000);
 const BACKGROUND_STOP_GRACE_MS = Number(process.env.TERMUX_MCP_BACKGROUND_STOP_GRACE_MS || 3000);
-const SESSION_STATUS_PREFIX = "__TERMUX_MCP_COMMAND_STATUS__";
 const ROOTS = (process.env.TERMUX_MCP_ALLOWED_ROOTS || HOME)
   .split(path.delimiter)
   .map((value) => path.resolve(value))
@@ -193,14 +192,6 @@ async function waitForPidExit(pid, timeoutMs) {
   return !isPidRunning(pid);
 }
 
-function summarizeCommandText(text) {
-  return text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find(Boolean)
-    ?.slice(0, 160) || "(shell command)";
-}
-
 function buildSessionSnapshot(session, status = "running", extra = {}) {
   return {
     session_id: session.id,
@@ -210,17 +201,6 @@ function buildSessionSnapshot(session, status = "running", extra = {}) {
     created_at: session.createdAt,
     updated_at: session.updatedAt,
     status,
-    is_busy: Boolean(session.activeCommandId),
-    active_command: session.activeCommandId
-      ? {
-          command_id: session.activeCommandId,
-          command_text: session.activeCommandText,
-          started_at: session.activeCommandStartedAt
-        }
-      : null,
-    last_exit_code: session.lastExitCode,
-    last_exit_signal: session.lastExitSignal,
-    shell_prompt_seen: session.shellPromptSeen,
     buffered_bytes: Buffer.byteLength(session.stdout, "utf8"),
     dropped_bytes: session.droppedBytes,
     ...extra
@@ -269,81 +249,12 @@ function registerRecentSessionSnapshot(session, reason, shellExitCode = null, sh
   );
 }
 
-function findMarkerStartIndex(text) {
-  const start = text.indexOf(SESSION_STATUS_PREFIX);
-  return start >= 0 ? start : -1;
-}
-
-function appendVisibleSessionOutput(session, text) {
+function appendSessionOutput(session, text) {
   const combined = session.stdout + text;
   const { text: kept, droppedBytes } = keepUtf8Tail(combined, MAX_OUTPUT * 2);
   session.stdout = kept;
   session.droppedBytes += droppedBytes;
   session.updatedAt = Date.now();
-}
-
-function handleSessionStatusLine(session, line) {
-  if (!line.startsWith(`${SESSION_STATUS_PREFIX}\t`)) {
-    return false;
-  }
-
-  const parts = line.split("\t");
-  if (parts.length < 4) {
-    return false;
-  }
-
-  const [, commandId, exitCodeText, ...cwdParts] = parts;
-  const exitCode = Number.parseInt(exitCodeText, 10);
-  const cwd = cwdParts.join("\t");
-  session.activeCommandId = null;
-  session.activeCommandText = "";
-  session.activeCommandStartedAt = 0;
-  session.lastExitCode = Number.isFinite(exitCode) ? exitCode : null;
-  session.lastExitSignal = session.pendingSignal || null;
-  session.pendingSignal = null;
-  session.shellPromptSeen = true;
-  if (cwd) {
-    session.cwd = cwd;
-  }
-  session.updatedAt = Date.now();
-  void saveSessionMetadata();
-  return commandId.length > 0;
-}
-
-function ingestSessionChunk(session, text) {
-  let combined = session.controlBuffer + text;
-  session.controlBuffer = "";
-
-  while (true) {
-    const newlineIndex = combined.indexOf("\n");
-    if (newlineIndex === -1) {
-      break;
-    }
-
-    const lineWithNewline = combined.slice(0, newlineIndex + 1);
-    combined = combined.slice(newlineIndex + 1);
-    const line = lineWithNewline.endsWith("\r\n")
-      ? lineWithNewline.slice(0, -2)
-      : lineWithNewline.slice(0, -1);
-
-    if (!handleSessionStatusLine(session, line)) {
-      appendVisibleSessionOutput(session, lineWithNewline);
-    }
-  }
-
-  const markerIndex = findMarkerStartIndex(combined);
-  if (markerIndex === -1) {
-    if (combined) {
-      appendVisibleSessionOutput(session, combined);
-    }
-    session.controlBuffer = "";
-    return;
-  }
-
-  if (markerIndex > 0) {
-    appendVisibleSessionOutput(session, combined.slice(0, markerIndex));
-  }
-  session.controlBuffer = combined.slice(markerIndex);
 }
 
 function readBufferedOutput(session, maxBytes, consume = true) {
@@ -366,43 +277,12 @@ function readBufferedOutput(session, maxBytes, consume = true) {
   };
 }
 
-function buildTrackedCommandInput(commandId, commandText) {
-  const delimiter = `__TERMUX_MCP_${randomId("cmd")}_EOF__`;
-  return [
-    `__termux_mcp_command=$(cat <<'${delimiter}'`,
-    commandText,
-    delimiter,
-    ")",
-    'eval "$__termux_mcp_command"',
-    "__termux_mcp_status=$?",
-    `printf '\\n${SESSION_STATUS_PREFIX}\\t%s\\t%s\\t%s\\n' '${commandId}' "$__termux_mcp_status" "$PWD"`,
-    "unset __termux_mcp_command __termux_mcp_status",
-    ""
-  ].join("\n");
-}
-
-function submitTrackedCommand(session, commandText, commandLabel) {
-  if (session.activeCommandId) {
-    throw new Error(
-      `Session ${session.id} is busy with command ${session.activeCommandId}. Read output or interrupt it before starting another command.`
-    );
-  }
-
-  const commandId = randomId("cmd");
-  session.activeCommandId = commandId;
-  session.activeCommandText = commandLabel || summarizeCommandText(commandText);
-  session.activeCommandStartedAt = Date.now();
-  session.lastExitCode = null;
-  session.lastExitSignal = null;
-  session.pendingSignal = null;
-  session.shellPromptSeen = false;
+function writeSessionInput(session, input, raw = false) {
+  const payload = raw || input.endsWith("\n") ? input : `${input}\n`;
+  session.process.stdin.write(payload);
   session.updatedAt = Date.now();
-  session.process.stdin.write(buildTrackedCommandInput(commandId, commandText));
   void saveSessionMetadata();
-  return {
-    command_id: commandId,
-    command_label: session.activeCommandText
-  };
+  return Buffer.byteLength(payload, "utf8");
 }
 
 function createShellSession(cwd) {
@@ -422,28 +302,16 @@ function createShellSession(cwd) {
     updatedAt: Date.now(),
     stdout: "",
     droppedBytes: 0,
-    controlBuffer: "",
-    activeCommandId: null,
-    activeCommandText: "",
-    activeCommandStartedAt: 0,
-    lastExitCode: null,
-    lastExitSignal: null,
-    pendingSignal: null,
-    shellPromptSeen: true,
     process: child
   };
 
   child.stdout.on("data", (chunk) => {
-    ingestSessionChunk(session, chunk.toString());
+    appendSessionOutput(session, chunk.toString());
   });
   child.stderr.on("data", (chunk) => {
-    ingestSessionChunk(session, chunk.toString());
+    appendSessionOutput(session, chunk.toString());
   });
   child.on("close", (code, signal) => {
-    if (session.controlBuffer) {
-      appendVisibleSessionOutput(session, session.controlBuffer);
-      session.controlBuffer = "";
-    }
     registerRecentSessionSnapshot(session, "shell_closed", code ?? null, signal ?? null);
     shellSessions.delete(id);
     void saveSessionMetadata();
@@ -879,36 +747,25 @@ function createMcpServer() {
     },
     async ({ cwd, command }) => {
       const session = createShellSession(cwd);
-      let initialCommand = null;
       if (command?.trim()) {
-        initialCommand = submitTrackedCommand(session, command, summarizeCommandText(command));
+        writeSessionInput(session, command, false);
       }
       const snapshot = buildSessionSnapshot(session);
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                ...snapshot,
-                initial_command: initialCommand
-              },
-              null,
-              2
-            )
+            text: JSON.stringify(snapshot, null, 2)
           }
         ],
-        structuredContent: {
-          ...snapshot,
-          initial_command: initialCommand
-        }
+        structuredContent: snapshot
       };
     }
   );
 
   server.tool(
     "list_sessions",
-    "List active shell sessions and their current busy/idle state.",
+    "List active shell sessions.",
     {},
     async () => {
       const sessions = [...shellSessions.values()]
@@ -923,76 +780,34 @@ function createMcpServer() {
 
   server.tool(
     "write_session",
-    "Run a tracked foreground shell command in a session by default. Use this for interactive or iterative terminal work where the shell should remain attached. If the command is meant to keep running in the background after the tool returns, use start_background_process instead. Use raw=true only for direct stdin writes to an already-running interactive program.",
+    "Write input into a running shell session. By default a trailing newline is added so shell commands execute normally. Use raw=true only for direct stdin writes to an already-running interactive program. If the command is meant to keep running in the background after the tool returns, use start_background_process instead.",
     {
       session_id: z.string(),
       input: z.string(),
-      command_label: z.string().optional(),
       raw: z.boolean().default(false)
     },
-    async ({ session_id, input, command_label, raw }) => {
+    async ({ session_id, input, raw }) => {
       const session = shellSessions.get(session_id);
       if (!session) {
         return getMissingSessionToolResult(session_id, "writing to the session");
       }
 
-      if (raw) {
-        session.process.stdin.write(input);
-        session.updatedAt = Date.now();
-        await saveSessionMetadata();
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                {
-                  session_id,
-                  raw: true,
-                  written: Buffer.byteLength(input, "utf8"),
-                  is_busy: Boolean(session.activeCommandId)
-                },
-                null,
-                2
-              )
-            }
-          ],
-          structuredContent: {
-            session_id,
-            raw: true,
-            written: Buffer.byteLength(input, "utf8"),
-            is_busy: Boolean(session.activeCommandId)
-          }
-        };
-      }
-
-      const commandInfo = submitTrackedCommand(session, input, command_label || summarizeCommandText(input));
+      const written = writeSessionInput(session, input, raw);
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(
-              {
-                session_id,
-                ...commandInfo,
-                is_busy: true
-              },
-              null,
-              2
-            )
+            text: JSON.stringify({ session_id, raw, written }, null, 2)
           }
         ],
-        structuredContent: {
-          session_id,
-          ...commandInfo,
-          is_busy: true
-        }
+        structuredContent: { session_id, raw, written }
       };
     }
   );
 
   server.tool(
     "read_session",
-    "Read buffered output and current tracked foreground-command state from a running shell session. Use this to observe progress of interactive foreground work started with write_session.",
+    "Read buffered output from a running shell session.",
     {
       session_id: z.string(),
       max_bytes: z.number().int().positive().max(MAX_OUTPUT).default(MAX_SESSION_READ_BYTES),
@@ -1008,10 +823,7 @@ function createMcpServer() {
       const snapshot = buildSessionSnapshot(session);
       const summaryLines = [
         `Read ${readResult.returnedBytes} bytes from session ${session_id}.`,
-        `Remaining unread bytes: ${readResult.remainingBytes}.`,
-        snapshot.is_busy
-          ? `Active command: ${snapshot.active_command?.command_text || snapshot.active_command?.command_id}.`
-          : "Session is idle."
+        `Remaining unread bytes: ${readResult.remainingBytes}.`
       ];
       if (peek) {
         summaryLines.push("Peek mode was enabled, so this chunk was not consumed.");
@@ -1030,49 +842,6 @@ function createMcpServer() {
           has_more: readResult.hasMore,
           dropped_bytes: readResult.droppedBytes,
           peek
-        }
-      };
-    }
-  );
-
-  server.tool(
-    "interrupt_session",
-    "Best-effort emergency stop for the current foreground task in a shell session. This is a recovery tool for a session command that should not keep running, not the normal way to manage long-running services. Prefer starting long-running services with start_background_process so they can be observed and stopped cleanly.",
-    {
-      session_id: z.string()
-    },
-    async ({ session_id }) => {
-      const session = shellSessions.get(session_id);
-      if (!session) {
-        return getMissingSessionToolResult(session_id, "interrupting the session");
-      }
-
-      session.pendingSignal = "SIGINT";
-      sendSignalToPid(session.process.pid, "SIGINT", false);
-      session.process.stdin.write("\u0003");
-      session.updatedAt = Date.now();
-      await saveSessionMetadata();
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify(
-              {
-                session_id,
-                interrupted: true,
-                is_busy: Boolean(session.activeCommandId),
-                active_command: buildSessionSnapshot(session).active_command
-              },
-              null,
-              2
-            )
-          }
-        ],
-        structuredContent: {
-          session_id,
-          interrupted: true,
-          is_busy: Boolean(session.activeCommandId),
-          active_command: buildSessionSnapshot(session).active_command
         }
       };
     }

@@ -60,13 +60,11 @@ http://0.0.0.0:8765/mcp
 - `start_session`
 - 启动一个可持续交互的终端会话，用于前台交互式任务
 - `list_sessions`
-- 查看当前活跃会话及其忙闲状态
+- 查看当前活跃会话
 - `write_session`
-- 默认按“可跟踪前台命令”提交 shell 命令；需要原始 stdin 时可用 `raw=true`
+- 往一个运行中的 shell session 写入输入；需要原始 stdin 时可用 `raw=true`
 - `read_session`
-- 分块读取会话输出，并返回当前前台命令状态
-- `interrupt_session`
-- 对当前前台命令做兜底中断；它是救场工具，不是后台服务主路径
+- 分块读取会话输出
 - `kill_session`
 - 结束会话
 - `start_background_process`
@@ -95,7 +93,6 @@ http://0.0.0.0:8765/mcp
 - 要启动 HTTP 服务、dev server、watcher、bot、长循环任务，直接用 `start_background_process`
 - 要看后台服务日志，用 `read_process_output`
 - 要停后台服务，用 `stop_background_process`
-- `interrupt_session` 只在“前台命令开错了，需要紧急打断”时用，不应该作为起服务后的常规控制方式
 
 ## 接入手机客户端后能做什么
 
@@ -147,14 +144,12 @@ TERMUX_MCP_PORT=9000 termux-mcp
 
 - 默认单次最多返回约 `12KB`
 - 会告诉客户端还有多少 `remaining_bytes`
-- 会返回 `is_busy`、`active_command`、`last_exit_code`、`last_exit_signal`
 - 如果只是想偷看但不消费缓冲区，可以传 `peek=true`
 - 如果输出在你读取前就已经太大，服务会丢弃更早的旧内容，并在结果里标出 `dropped_bytes`
 
 ### `write_session` 怎么用
 
-- 默认模式下，`write_session` 会把 `input` 当成一个可跟踪 shell 命令来提交
-- 如需更清晰的状态显示，可以额外传 `command_label`
+- 默认模式下，`write_session` 会在输入末尾补一个换行，让 shell 命令正常执行
 - 如果你是在和交互程序对话，需要原始 stdin，请传 `raw=true`
 - 如果这个命令本来就应该持续跑着，比如服务、watch 模式、轮询脚本，不要用 `write_session`，直接改用 `start_background_process`
 
