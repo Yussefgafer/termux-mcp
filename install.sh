@@ -52,6 +52,8 @@ MISSING_PACKAGES=""
 need_cmd git || MISSING_PACKAGES="$MISSING_PACKAGES git"
 need_cmd node || MISSING_PACKAGES="$MISSING_PACKAGES nodejs"
 need_cmd npm || MISSING_PACKAGES="$MISSING_PACKAGES nodejs"
+need_cmd patch || MISSING_PACKAGES="$MISSING_PACKAGES patch"
+need_cmd rg || MISSING_PACKAGES="$MISSING_PACKAGES ripgrep"
 
 if [ -n "$MISSING_PACKAGES" ]; then
   pkg update -y

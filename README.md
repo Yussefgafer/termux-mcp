@@ -59,12 +59,24 @@ http://0.0.0.0:8765/mcp
 - 执行一次性 shell 命令
 - `start_session`
 - 启动一个可持续交互的终端会话
+- `list_sessions`
+- 查看当前活跃会话及其忙闲状态
 - `write_session`
-- 向会话写入输入内容
+- 默认按“可跟踪命令”提交 shell 命令；需要原始 stdin 时可用 `raw=true`
 - `read_session`
-- 分块读取会话输出，避免一次性把大量终端内容灌进上下文
+- 分块读取会话输出，并返回当前前台命令状态
+- `interrupt_session`
+- 对当前前台命令发送中断，但保留 shell 会话
 - `kill_session`
 - 结束会话
+- `start_background_process`
+- 启动可持续运行的后台服务或长任务
+- `list_background_processes`
+- 列出由 termux-mcp 启动并追踪的后台进程
+- `read_process_output`
+- 分块读取后台进程 stdout/stderr 日志
+- `stop_background_process`
+- 温和停止后台进程，必要时自动强杀
 - `read_file`
 - 读取文本文件
 - `list_files`
@@ -107,8 +119,11 @@ http://0.0.0.0:8765/mcp
 - `TERMUX_MCP_ALLOWED_ROOTS`
 - `TERMUX_MCP_MAX_OUTPUT`
 - `TERMUX_MCP_MAX_SESSION_READ_BYTES`
+- `TERMUX_MCP_MAX_PROCESS_READ_BYTES`
 - `TERMUX_MCP_MAX_IMAGE_BYTES`
 - `TERMUX_MCP_SESSION_IDLE_MS`
+- `TERMUX_MCP_RECENT_SESSION_TTL_MS`
+- `TERMUX_MCP_BACKGROUND_STOP_GRACE_MS`
 - `TERMUX_MCP_HOME`
 
 示例：
@@ -123,8 +138,24 @@ TERMUX_MCP_PORT=9000 termux-mcp
 
 - 默认单次最多返回约 `12KB`
 - 会告诉客户端还有多少 `remaining_bytes`
+- 会返回 `is_busy`、`active_command`、`last_exit_code`、`last_exit_signal`
 - 如果只是想偷看但不消费缓冲区，可以传 `peek=true`
 - 如果输出在你读取前就已经太大，服务会丢弃更早的旧内容，并在结果里标出 `dropped_bytes`
+
+### `write_session` 怎么用
+
+- 默认模式下，`write_session` 会把 `input` 当成一个可跟踪 shell 命令来提交
+- 如需更清晰的状态显示，可以额外传 `command_label`
+- 如果你是在和交互程序对话，需要原始 stdin，请传 `raw=true`
+
+### 后台服务怎么跑
+
+推荐把长时间运行的服务交给后台进程工具，而不是让 `exec_command` 一直挂到超时：
+
+- `start_background_process` 启动服务并返回 `process_id`
+- `list_background_processes` 查看它是否仍在运行
+- `read_process_output` 读取日志
+- `stop_background_process` 停掉服务
 
 ### `view_image` 返回的是什么
 
