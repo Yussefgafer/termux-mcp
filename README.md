@@ -62,7 +62,7 @@ http://0.0.0.0:8765/mcp
 - `write_session`
 - 向会话写入输入内容
 - `read_session`
-- 读取会话输出
+- 分块读取会话输出，避免一次性把大量终端内容灌进上下文
 - `kill_session`
 - 结束会话
 - `read_file`
@@ -74,7 +74,7 @@ http://0.0.0.0:8765/mcp
 - `apply_patch`
 - 以 patch 方式修改文件
 - `view_image`
-- 查看本地图片文件信息
+- 读取本地图片，并返回真正的图片内容给多模态客户端
 
 ## 接入手机客户端后能做什么
 
@@ -106,6 +106,8 @@ http://0.0.0.0:8765/mcp
 - `TERMUX_MCP_RUNTIME_DIR`
 - `TERMUX_MCP_ALLOWED_ROOTS`
 - `TERMUX_MCP_MAX_OUTPUT`
+- `TERMUX_MCP_MAX_SESSION_READ_BYTES`
+- `TERMUX_MCP_MAX_IMAGE_BYTES`
 - `TERMUX_MCP_SESSION_IDLE_MS`
 - `TERMUX_MCP_HOME`
 
@@ -114,6 +116,24 @@ http://0.0.0.0:8765/mcp
 ```sh
 TERMUX_MCP_PORT=9000 termux-mcp
 ```
+
+### `read_session` 现在会做什么
+
+为了避免终端会话把超长输出一次性灌给模型，`read_session` 改成了默认按块读取：
+
+- 默认单次最多返回约 `12KB`
+- 会告诉客户端还有多少 `remaining_bytes`
+- 如果只是想偷看但不消费缓冲区，可以传 `peek=true`
+- 如果输出在你读取前就已经太大，服务会丢弃更早的旧内容，并在结果里标出 `dropped_bytes`
+
+### `view_image` 返回的是什么
+
+`view_image` 不再只返回文件元信息，而是会返回：
+
+- 一段简短文字说明
+- 一条原生 MCP `image` content
+
+这样支持多模态的客户端就能把图片真正送进模型上下文，而不只是告诉模型“这里有一张图”。
 
 ## 卸载
 

@@ -16,6 +16,8 @@ const PORT = Number(process.env.TERMUX_MCP_PORT || 8765);
 const RUNTIME_DIR = process.env.TERMUX_MCP_RUNTIME_DIR || path.join(HOME, ".termux-mcp");
 const SESSION_DIR = path.join(RUNTIME_DIR, "sessions");
 const MAX_OUTPUT = Number(process.env.TERMUX_MCP_MAX_OUTPUT || 64 * 1024);
+const MAX_SESSION_READ_BYTES = Number(process.env.TERMUX_MCP_MAX_SESSION_READ_BYTES || 12 * 1024);
+const MAX_IMAGE_BYTES = Number(process.env.TERMUX_MCP_MAX_IMAGE_BYTES || 8 * 1024 * 1024);
 const SESSION_IDLE_MS = Number(process.env.TERMUX_MCP_SESSION_IDLE_MS || 30 * 60 * 1000);
 const ROOTS = (process.env.TERMUX_MCP_ALLOWED_ROOTS || HOME)
   .split(":")
@@ -53,6 +55,85 @@ function limitText(text, maxBytes = MAX_OUTPUT) {
   return output;
 }
 
+function clampPositiveInt(value, fallback, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return Math.min(Math.trunc(parsed), max);
+}
+
+function splitUtf8Prefix(text, maxBytes) {
+  if (!text) {
+    return { head: "", tail: "", headBytes: 0 };
+  }
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) {
+    return { head: text, tail: "", headBytes: Buffer.byteLength(text, "utf8") };
+  }
+
+  let end = Math.min(text.length, maxBytes);
+  while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > maxBytes) {
+    end -= 1;
+  }
+
+  const head = text.slice(0, end);
+  return {
+    head,
+    tail: text.slice(end),
+    headBytes: Buffer.byteLength(head, "utf8")
+  };
+}
+
+function keepUtf8Tail(text, maxBytes) {
+  if (!text) {
+    return { text: "", droppedBytes: 0 };
+  }
+  const size = Buffer.byteLength(text, "utf8");
+  if (size <= maxBytes) {
+    return { text, droppedBytes: 0 };
+  }
+
+  let start = Math.max(0, text.length - maxBytes);
+  while (start < text.length && Buffer.byteLength(text.slice(start), "utf8") > maxBytes) {
+    start += 1;
+  }
+
+  const kept = text.slice(start);
+  return {
+    text: kept,
+    droppedBytes: size - Buffer.byteLength(kept, "utf8")
+  };
+}
+
+function appendSessionOutput(session, text) {
+  const combined = session.stdout + text;
+  const { text: kept, droppedBytes } = keepUtf8Tail(combined, MAX_OUTPUT * 2);
+  session.stdout = kept;
+  session.droppedBytes += droppedBytes;
+  session.updatedAt = Date.now();
+}
+
+function guessImageMimeType(realPath) {
+  const ext = path.extname(realPath).toLowerCase();
+  switch (ext) {
+    case ".png":
+      return "image/png";
+    case ".jpg":
+    case ".jpeg":
+      return "image/jpeg";
+    case ".webp":
+      return "image/webp";
+    case ".gif":
+      return "image/gif";
+    case ".bmp":
+      return "image/bmp";
+    case ".svg":
+      return "image/svg+xml";
+    default:
+      return null;
+  }
+}
+
 function randomId(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
@@ -69,10 +150,24 @@ function saveSessionMetadata() {
   return fsp.writeFile(path.join(RUNTIME_DIR, "sessions.json"), JSON.stringify(items, null, 2));
 }
 
-function readBufferedOutput(session) {
-  const stdout = session.stdout;
-  session.stdout = "";
-  return stdout;
+function readBufferedOutput(session, maxBytes, consume = true) {
+  const safeMaxBytes = clampPositiveInt(maxBytes, MAX_SESSION_READ_BYTES, MAX_OUTPUT);
+  const { head, tail, headBytes } = splitUtf8Prefix(session.stdout, safeMaxBytes);
+  const remainingBytes = Buffer.byteLength(tail, "utf8");
+  const droppedBytes = session.droppedBytes;
+
+  if (consume) {
+    session.stdout = tail;
+    session.droppedBytes = 0;
+  }
+
+  return {
+    output: head,
+    returnedBytes: headBytes,
+    remainingBytes,
+    hasMore: remainingBytes > 0,
+    droppedBytes
+  };
 }
 
 function ensureSession(id) {
@@ -146,15 +241,14 @@ function createShellSession(command, cwd) {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     stdout: "",
+    droppedBytes: 0,
     process: child
   };
   child.stdout.on("data", (chunk) => {
-    session.stdout = limitText(session.stdout + chunk.toString(), MAX_OUTPUT * 2);
-    session.updatedAt = Date.now();
+    appendSessionOutput(session, chunk.toString());
   });
   child.stderr.on("data", (chunk) => {
-    session.stdout = limitText(session.stdout + chunk.toString(), MAX_OUTPUT * 2);
-    session.updatedAt = Date.now();
+    appendSessionOutput(session, chunk.toString());
   });
   child.on("close", () => {
     shellSessions.delete(id);
@@ -241,14 +335,37 @@ function createMcpServer() {
 
   server.tool(
     "read_session",
-    "Read buffered output from a running shell session.",
+    "Read buffered output from a running shell session in bounded chunks to avoid flooding context.",
     {
-      session_id: z.string()
+      session_id: z.string(),
+      max_bytes: z.number().int().positive().max(MAX_OUTPUT).default(MAX_SESSION_READ_BYTES),
+      peek: z.boolean().default(false)
     },
-    async ({ session_id }) => {
+    async ({ session_id, max_bytes, peek }) => {
       const session = ensureSession(session_id);
+      const readResult = readBufferedOutput(session, max_bytes, !peek);
+      const summaryLines = [
+        `Read ${readResult.returnedBytes} bytes from session ${session_id}.`,
+        `Remaining unread bytes: ${readResult.remainingBytes}.`
+      ];
+      if (peek) {
+        summaryLines.push("Peek mode was enabled, so this chunk was not consumed.");
+      }
+      if (readResult.droppedBytes > 0) {
+        summaryLines.push(`Warning: ${readResult.droppedBytes} older buffered bytes were dropped before this read.`);
+      }
+      const body = readResult.output || "(no new output)";
       return {
-        content: [{ type: "text", text: JSON.stringify({ session_id, output: readBufferedOutput(session) }, null, 2) }]
+        content: [{ type: "text", text: `${summaryLines.join(" ")}\n\n${body}` }],
+        structuredContent: {
+          session_id,
+          output: readResult.output,
+          returned_bytes: readResult.returnedBytes,
+          remaining_bytes: readResult.remainingBytes,
+          has_more: readResult.hasMore,
+          dropped_bytes: readResult.droppedBytes,
+          peek
+        }
       };
     }
   );
@@ -355,20 +472,39 @@ function createMcpServer() {
 
   server.tool(
     "view_image",
-    "Return metadata for an image file on disk.",
+    "Load an image file from disk and return real image content that multimodal clients can pass to models.",
     {
       path: z.string()
     },
     async ({ path: inputPath }) => {
       const realPath = normalizePath(inputPath);
+      const mimeType = guessImageMimeType(realPath);
+      if (!mimeType) {
+        throw new Error(`Unsupported image type for ${realPath}`);
+      }
       const stats = await fsp.stat(realPath);
+      if (stats.size > MAX_IMAGE_BYTES) {
+        throw new Error(`Image is too large to return through MCP (${stats.size} bytes > ${MAX_IMAGE_BYTES} bytes)`);
+      }
+      const data = await fsp.readFile(realPath);
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ path: realPath, size: stats.size, modified_at: stats.mtime.toISOString() }, null, 2)
+            text: `Loaded image ${path.basename(realPath)} (${mimeType}, ${stats.size} bytes) from ${realPath}.`
+          },
+          {
+            type: "image",
+            data: data.toString("base64"),
+            mimeType
           }
-        ]
+        ],
+        structuredContent: {
+          path: realPath,
+          mime_type: mimeType,
+          size: stats.size,
+          modified_at: stats.mtime.toISOString()
+        }
       };
     }
   );
