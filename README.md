@@ -56,21 +56,21 @@ http://0.0.0.0:8765/mcp
 ## 已提供的 MCP Tools
 
 - `exec_command`
-- 执行一次性 shell 命令
+- 执行短时、一次性 shell 命令
 - `start_session`
-- 启动一个可持续交互的终端会话
+- 启动一个可持续交互的终端会话，用于前台交互式任务
 - `list_sessions`
 - 查看当前活跃会话及其忙闲状态
 - `write_session`
-- 默认按“可跟踪命令”提交 shell 命令；需要原始 stdin 时可用 `raw=true`
+- 默认按“可跟踪前台命令”提交 shell 命令；需要原始 stdin 时可用 `raw=true`
 - `read_session`
 - 分块读取会话输出，并返回当前前台命令状态
 - `interrupt_session`
-- 对当前前台命令发送中断，但保留 shell 会话
+- 对当前前台命令做兜底中断；它是救场工具，不是后台服务主路径
 - `kill_session`
 - 结束会话
 - `start_background_process`
-- 启动可持续运行的后台服务或长任务
+- 启动可持续运行的后台服务或长任务；这是起服务的首选工具
 - `list_background_processes`
 - 列出由 termux-mcp 启动并追踪的后台进程
 - `read_process_output`
@@ -87,6 +87,15 @@ http://0.0.0.0:8765/mcp
 - 以 patch 方式修改文件
 - `view_image`
 - 读取本地图片，并返回真正的图片内容给多模态客户端
+
+## 工具选型规则
+
+- 要跑一个会很快结束的普通命令，用 `exec_command`
+- 要在同一个 shell 里反复执行前台命令、保留 cwd/环境/交互状态，用 `start_session` + `write_session` + `read_session`
+- 要启动 HTTP 服务、dev server、watcher、bot、长循环任务，直接用 `start_background_process`
+- 要看后台服务日志，用 `read_process_output`
+- 要停后台服务，用 `stop_background_process`
+- `interrupt_session` 只在“前台命令开错了，需要紧急打断”时用，不应该作为起服务后的常规控制方式
 
 ## 接入手机客户端后能做什么
 
@@ -147,10 +156,11 @@ TERMUX_MCP_PORT=9000 termux-mcp
 - 默认模式下，`write_session` 会把 `input` 当成一个可跟踪 shell 命令来提交
 - 如需更清晰的状态显示，可以额外传 `command_label`
 - 如果你是在和交互程序对话，需要原始 stdin，请传 `raw=true`
+- 如果这个命令本来就应该持续跑着，比如服务、watch 模式、轮询脚本，不要用 `write_session`，直接改用 `start_background_process`
 
 ### 后台服务怎么跑
 
-推荐把长时间运行的服务交给后台进程工具，而不是让 `exec_command` 一直挂到超时：
+推荐把长时间运行的服务交给后台进程工具，而不是让 `exec_command` 或前台 session 一直挂着：
 
 - `start_background_process` 启动服务并返回 `process_id`
 - `list_background_processes` 查看它是否仍在运行

@@ -854,7 +854,7 @@ function createMcpServer() {
 
   server.tool(
     "exec_command",
-    "Execute a one-shot shell command in an allowed working directory.",
+    "Execute a short-lived one-shot shell command in an allowed working directory. Do not use this for servers, watchers, tail -f, sleep loops, or anything expected to stay running; use start_background_process for detached services and start_session/write_session for interactive foreground work.",
     {
       command: z.string().min(1),
       cwd: z.string().default(HOME),
@@ -872,7 +872,7 @@ function createMcpServer() {
 
   server.tool(
     "start_session",
-    "Start a persistent shell session and optionally run an initial tracked shell command.",
+    "Start a persistent shell session for interactive or stateful foreground shell work. Use this when later commands need the same shell state or cwd. Do not use it as the preferred way to launch detached services; use start_background_process for long-running servers.",
     {
       cwd: z.string().default(HOME),
       command: z.string().optional()
@@ -923,7 +923,7 @@ function createMcpServer() {
 
   server.tool(
     "write_session",
-    "Run a tracked shell command in a session by default. Use raw=true only for interactive stdin writes.",
+    "Run a tracked foreground shell command in a session by default. Use this for interactive or iterative terminal work where the shell should remain attached. If the command is meant to keep running in the background after the tool returns, use start_background_process instead. Use raw=true only for direct stdin writes to an already-running interactive program.",
     {
       session_id: z.string(),
       input: z.string(),
@@ -992,7 +992,7 @@ function createMcpServer() {
 
   server.tool(
     "read_session",
-    "Read buffered output and current tracked command state from a running shell session.",
+    "Read buffered output and current tracked foreground-command state from a running shell session. Use this to observe progress of interactive foreground work started with write_session.",
     {
       session_id: z.string(),
       max_bytes: z.number().int().positive().max(MAX_OUTPUT).default(MAX_SESSION_READ_BYTES),
@@ -1037,7 +1037,7 @@ function createMcpServer() {
 
   server.tool(
     "interrupt_session",
-    "Send Ctrl-C to the current foreground task in a shell session without destroying the shell.",
+    "Best-effort emergency stop for the current foreground task in a shell session. This is a recovery tool for a session command that should not keep running, not the normal way to manage long-running services. Prefer starting long-running services with start_background_process so they can be observed and stopped cleanly.",
     {
       session_id: z.string()
     },
@@ -1106,7 +1106,7 @@ function createMcpServer() {
 
   server.tool(
     "start_background_process",
-    "Start a detached background process with log files so AI can observe long-running services without blocking.",
+    "Start a detached background process with log files so AI can observe long-running services without blocking. This is the preferred tool for HTTP servers, dev servers, watchers, bot loops, and other tasks meant to keep running after the tool call returns.",
     {
       command: z.string().min(1),
       cwd: z.string().default(HOME),
@@ -1142,7 +1142,7 @@ function createMcpServer() {
 
   server.tool(
     "read_process_output",
-    "Read bounded stdout or stderr chunks from a tracked background process.",
+    "Read bounded stdout or stderr chunks from a tracked background process. Use this to monitor services started with start_background_process without flooding context.",
     {
       process_id: z.string(),
       stream: z.enum(["stdout", "stderr", "combined"]).default("combined"),
