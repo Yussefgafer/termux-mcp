@@ -21,7 +21,6 @@ const BACKGROUND_PROCESS_METADATA_PATH = path.join(RUNTIME_DIR, "background_proc
 const MAX_OUTPUT = Number(process.env.TERMUX_MCP_MAX_OUTPUT || 64 * 1024);
 const MAX_SESSION_READ_BYTES = Number(process.env.TERMUX_MCP_MAX_SESSION_READ_BYTES || 12 * 1024);
 const MAX_PROCESS_READ_BYTES = Number(process.env.TERMUX_MCP_MAX_PROCESS_READ_BYTES || 12 * 1024);
-const MAX_IMAGE_BYTES = Number(process.env.TERMUX_MCP_MAX_IMAGE_BYTES || 8 * 1024 * 1024);
 const SESSION_IDLE_MS = Number(process.env.TERMUX_MCP_SESSION_IDLE_MS || 30 * 60 * 1000);
 const RECENT_SESSION_TTL_MS = Number(process.env.TERMUX_MCP_RECENT_SESSION_TTL_MS || 10 * 60 * 1000);
 const BACKGROUND_STOP_GRACE_MS = Number(process.env.TERMUX_MCP_BACKGROUND_STOP_GRACE_MS || 3000);
@@ -124,27 +123,6 @@ function sleep(ms) {
 
 function randomId(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function guessImageMimeType(realPath) {
-  const ext = path.extname(realPath).toLowerCase();
-  switch (ext) {
-    case ".png":
-      return "image/png";
-    case ".jpg":
-    case ".jpeg":
-      return "image/jpeg";
-    case ".webp":
-      return "image/webp";
-    case ".gif":
-      return "image/gif";
-    case ".bmp":
-      return "image/bmp";
-    case ".svg":
-      return "image/svg+xml";
-    default:
-      return null;
-  }
 }
 
 function isPidRunning(pid) {
@@ -404,6 +382,12 @@ function buildSearchCommand(realPath, query) {
   const safePath = JSON.stringify(realPath);
   const safeQuery = JSON.stringify(query);
   return `command -v rg >/dev/null 2>&1 && rg -n --no-heading --fixed-strings --color never ${safeQuery} ${safePath} || grep -RInF ${safeQuery} ${safePath}`;
+}
+
+function buildRegExp(pattern, flags) {
+  const safeFlags = flags && /^[gimsuy]*$/.test(flags) ? flags : "g";
+  const finalFlags = safeFlags.includes("g") ? safeFlags : `${safeFlags}g`;
+  return new RegExp(pattern, finalFlags);
 }
 
 function extractPatchedFiles(patchText) {
@@ -1094,40 +1078,114 @@ function createMcpServer() {
   );
 
   server.tool(
-    "view_image",
-    "Load an image file from disk and return real image content that multimodal clients can pass to models.",
+    "write_file",
+    "Write to a file in one of four modes: 'overwrite' (replace entire file content), 'append' (add text at the end), 'prepend' (add text at the beginning), or 'regex_replace' (find pattern matches and replace them). Creates the file and parent directories if they don't exist (except regex_replace, which requires an existing file).",
     {
-      path: z.string()
+      path: z.string(),
+      mode: z.enum(["overwrite", "append", "prepend", "regex_replace"]),
+      content: z.string().optional(),
+      pattern: z.string().optional(),
+      replacement: z.string().optional(),
+      flags: z.string().optional()
     },
-    async ({ path: inputPath }) => {
+    async ({ path: inputPath, mode, content, pattern, replacement, flags }) => {
       const realPath = normalizePath(inputPath);
-      const mimeType = guessImageMimeType(realPath);
-      if (!mimeType) {
-        throw new Error(`Unsupported image type for ${realPath}`);
-      }
-      const stats = await fsp.stat(realPath);
-      if (stats.size > MAX_IMAGE_BYTES) {
-        throw new Error(`Image is too large to return through MCP (${stats.size} bytes > ${MAX_IMAGE_BYTES} bytes)`);
-      }
-      const data = await fsp.readFile(realPath);
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Loaded image ${path.basename(realPath)} (${mimeType}, ${stats.size} bytes) from ${realPath}.`
-          },
-          {
-            type: "image",
-            data: data.toString("base64"),
-            mimeType
-          }
-        ],
-        structuredContent: {
-          path: realPath,
-          mime_type: mimeType,
-          size: stats.size,
-          modified_at: stats.mtime.toISOString()
+
+      if (mode === "overwrite" || mode === "append" || mode === "prepend") {
+        if (content === undefined) {
+          throw new Error(`"content" is required for mode "${mode}"`);
         }
+
+        await fsp.mkdir(path.dirname(realPath), { recursive: true });
+
+        let existing = "";
+        const fileExisted = fs.existsSync(realPath);
+        if (mode !== "overwrite" && fileExisted) {
+          existing = await fsp.readFile(realPath, "utf8");
+        }
+
+        let finalContent;
+        if (mode === "overwrite") {
+          finalContent = content;
+        } else if (mode === "append") {
+          finalContent = existing + content;
+        } else {
+          finalContent = content + existing;
+        }
+
+        await fsp.writeFile(realPath, finalContent, "utf8");
+        const stats = await fsp.stat(realPath);
+
+        const result = {
+          path: realPath,
+          mode,
+          created: !fileExisted,
+          bytes_written: Buffer.byteLength(finalContent, "utf8"),
+          size: stats.size
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          structuredContent: result
+        };
+      }
+
+      // regex_replace
+      if (!pattern) {
+        throw new Error(`"pattern" is required for mode "regex_replace"`);
+      }
+      if (replacement === undefined) {
+        throw new Error(`"replacement" is required for mode "regex_replace"`);
+      }
+      if (!fs.existsSync(realPath)) {
+        throw new Error(`File does not exist: ${realPath}`);
+      }
+
+      const original = await fsp.readFile(realPath, "utf8");
+      let regex;
+      try {
+        regex = buildRegExp(pattern, flags);
+      } catch (error) {
+        throw new Error(`Invalid regex pattern: ${error.message}`);
+      }
+
+      let matchCount = 0;
+      const updated = original.replace(regex, (...args) => {
+        matchCount += 1;
+        // Support $1, $2... capture group substitution natively via String.replace.
+        return replacement.replace(/\$(\d+|&)/g, (token, group) => {
+          if (group === "&") return args[0];
+          const index = Number(group);
+          const value = args[index];
+          return value === undefined ? "" : value;
+        });
+      });
+
+      if (matchCount === 0) {
+        const result = {
+          path: realPath,
+          mode,
+          matches_replaced: 0,
+          changed: false
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          structuredContent: result,
+          isError: false
+        };
+      }
+
+      await fsp.writeFile(realPath, updated, "utf8");
+      const stats = await fsp.stat(realPath);
+      const result = {
+        path: realPath,
+        mode,
+        matches_replaced: matchCount,
+        changed: true,
+        size: stats.size
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        structuredContent: result
       };
     }
   );
