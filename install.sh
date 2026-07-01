@@ -2,7 +2,7 @@
 
 set -eu
 
-REPO_URL="${TERMUX_MCP_REPO_URL:-https://github.com/yuxinjiang218-creator/termux-mcp.git}"
+REPO_URL="${TERMUX_MCP_REPO_URL:-https://github.com/Yussefgafer/termux-mcp.git}"
 INSTALL_DIR="${TERMUX_MCP_HOME:-$HOME/termux-mcp}"
 BIN_DIR="$HOME/bin"
 PROFILE_BASHRC="$HOME/.bashrc"
